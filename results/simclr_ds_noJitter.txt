@@ -1,0 +1,130 @@
+from torchvision import datasets, transforms
+import torch
+from utilities import Sobel
+from SimCLR_model import SimCLR_DownStream
+device = ("cuda:0" if torch.cuda.is_available else "cpu")
+
+train_dataset = datasets.MNIST(root="./dataset", train=True, transform=transforms.ToTensor(), download=True)
+Ntr = 60000
+torch.manual_seed(0)
+chosen_tr = torch.randperm(train_dataset.data.size(dim=0))[:Ntr]
+
+train_dataset.data = train_dataset.data[chosen_tr,:,:] # [Ntr, 28, 28] float32  /255
+train_dataset.targets = train_dataset.targets[chosen_tr]
+train_dataset.targets.requires_grad = False
+trainloader = torch.utils.data.DataLoader(train_dataset,batch_size=256, shuffle=True)
+
+simclr = SimCLR_DownStream(out_feas=10, device=device)
+simclr.load_state_dict(torch.load("./models/train_noJitter/simclr_unsup_tau0.1_Adam_lr0.0003_decay0.0002_Ntr6000_eph200.pth",map_location=device),strict=False)
+simclr.fit(trainloader,max_epoch=200,lr=1e-3)
+
+
+
+class SimCLR_DownStream(nn.Module):
+    def __init__(self, out_feas=128, gray=True, device="cuda:0"):
+        super(self.__class__, self).__init__()
+
+        # self.backbone = SimCLR().backbone.to(device)
+        self.backbone = models.resnet50(pretrained=False).to(device)
+        mlp_in_feas = self.backbone.fc.in_features
+        if gray: self.backbone.conv1 = torch.nn.Conv2d(1,64,kernel_size=7,stride=2, padding=3, bias=False).to(device)
+        for param in self.backbone.parameters():
+            param.requires_grad = False # 冻结网络f, 训练过程中不更新f的参数
+
+        self.backbone.fc = nn.Linear(in_features=mlp_in_feas, out_features=out_feas, bias=True).to(device)
+        self.loss_fn = nn.CrossEntropyLoss().to(device)
+
+    def forward(self, X): # X:[B,1,28,28](MNIST)
+        z = self.backbone(X) # h:[B,512]
+        # z = self.mlp(h) # z:[B,out_feas];
+        return z
+
+    def fit(self, trainloader, lr=1e-3, weight_decay=2e-4, max_epoch=500, device="cuda:0"):
+        print("...Training...\nlr={:.4f}  wei_decay={:.4f}  epoches={:d}  bs={:d}"\
+              .format(lr,weight_decay,max_epoch,trainloader.batch_size))
+
+        optimizer = torch.optim.Adam(self.backbone.fc.parameters(), lr=lr,weight_decay=weight_decay) # 
+        for epoch in range(1,max_epoch+1):
+            self.train()
+            Tr_loss = 0
+            for X,labels in trainloader:
+                X, labels = X.to(device), labels.to(device)
+                z = self.forward(X) # [bs,cls]
+                loss = self.loss_fn(z, labels) # cross entropy
+                Tr_loss += loss.item()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            if epoch%10==0:
+                torch.save(self.state_dict(), "./models/down_stream/"+str(optimizer.__class__)[-6:-2]\
+                           +"_lr"+str(lr)+"_decay"+str(weight_decay)+"_eph"+str(epoch)+".pth")
+                self.eval()
+                with torch.no_grad():
+                    total_correct_1, total_correct_5, total_num = 0.0, 0.0, 0
+                    for data, labels in trainloader:
+                        data, labels = data.to(device), labels.to(device)
+                        total_num += data.size(dim=0)
+
+                        pred_cls = self.forward(data)
+                        _, pred_cls = torch.topk(pred_cls, k=5, dim=-1, largest=True)
+                        top1_acc = torch.sum(( pred_cls[:,0] == labels ).float()).item() # item():tensor->float
+                        top5_acc = torch.sum(( pred_cls[:,0:5] == labels.unsqueeze(-1).repeat(1,5) ).any(dim=-1)).item()
+                        total_correct_1 += top1_acc
+                        total_correct_5 += top5_acc
+                    print("epoch{:3d}: InfoNCE Loss={:e} ".format(epoch, Tr_loss),
+                          "Top1 acc={:.4f}%".format(total_correct_1/total_num*100),
+                          "Top5 acc={:.4f}%".format(total_correct_5/total_num*100))
+
+
+
+lr=0.0010  wei_decay=0.0002  epoches=1000  bs=256
+epoch 10: InfoNCE Loss=5.635382e+01  Top1 acc=92.7867% Top5 acc=99.8933%
+epoch 20: InfoNCE Loss=4.807371e+01  Top1 acc=93.9500% Top5 acc=99.9183%
+epoch 30: InfoNCE Loss=4.437831e+01  Top1 acc=94.4917% Top5 acc=99.9300%
+epoch 40: InfoNCE Loss=4.142921e+01  Top1 acc=94.7500% Top5 acc=99.9417%
+epoch 50: InfoNCE Loss=4.021198e+01  Top1 acc=94.6017% Top5 acc=99.9367%
+epoch 60: InfoNCE Loss=3.894904e+01  Top1 acc=95.1150% Top5 acc=99.9500%
+epoch 70: InfoNCE Loss=3.818741e+01  Top1 acc=95.3350% Top5 acc=99.9633%
+epoch 80: InfoNCE Loss=3.708657e+01  Top1 acc=95.6383% Top5 acc=99.9633%
+epoch 90: InfoNCE Loss=3.695367e+01  Top1 acc=95.5500% Top5 acc=99.9700%
+epoch100: InfoNCE Loss=3.605310e+01  Top1 acc=95.0833% Top5 acc=99.9650%
+epoch110: InfoNCE Loss=3.617031e+01  Top1 acc=95.6017% Top5 acc=99.9617%
+epoch120: InfoNCE Loss=3.561956e+01  Top1 acc=95.5083% Top5 acc=99.9700%
+epoch130: InfoNCE Loss=3.535274e+01  Top1 acc=95.7900% Top5 acc=99.9700%
+epoch140: InfoNCE Loss=3.580914e+01  Top1 acc=95.6433% Top5 acc=99.9667%
+epoch150: InfoNCE Loss=3.536031e+01  Top1 acc=95.4950% Top5 acc=99.9700%
+epoch160: InfoNCE Loss=3.490220e+01  Top1 acc=95.7117% Top5 acc=99.9683%
+epoch170: InfoNCE Loss=3.474745e+01  Top1 acc=95.7917% Top5 acc=99.9700%
+epoch180: InfoNCE Loss=3.461037e+01  Top1 acc=95.7167% Top5 acc=99.9683%
+epoch190: InfoNCE Loss=3.460572e+01  Top1 acc=95.6967% Top5 acc=99.9700%
+epoch200: InfoNCE Loss=3.442182e+01  Top1 acc=95.6883% Top5 acc=99.9750%
+epoch210: InfoNCE Loss=3.459960e+01  Top1 acc=95.7583% Top5 acc=99.9583%
+epoch220: InfoNCE Loss=3.423919e+01  Top1 acc=95.9717% Top5 acc=99.9700%
+epoch230: InfoNCE Loss=3.429559e+01  Top1 acc=95.8583% Top5 acc=99.9750%
+epoch240: InfoNCE Loss=3.388479e+01  Top1 acc=95.5950% Top5 acc=99.9733%
+epoch250: InfoNCE Loss=3.421400e+01  Top1 acc=95.6500% Top5 acc=99.9683%
+epoch260: InfoNCE Loss=3.436494e+01  Top1 acc=95.8567% Top5 acc=99.9717%
+epoch270: InfoNCE Loss=3.443187e+01  Top1 acc=95.7433% Top5 acc=99.9717%
+epoch280: InfoNCE Loss=3.472543e+01  Top1 acc=95.7517% Top5 acc=99.9733%
+epoch290: InfoNCE Loss=3.458989e+01  Top1 acc=96.0700% Top5 acc=99.9683%
+epoch300: InfoNCE Loss=3.454043e+01  Top1 acc=95.7183% Top5 acc=99.9650%
+epoch310: InfoNCE Loss=3.423119e+01  Top1 acc=95.6200% Top5 acc=99.9717%
+epoch320: InfoNCE Loss=3.444680e+01  Top1 acc=95.9267% Top5 acc=99.9717%
+epoch330: InfoNCE Loss=3.481813e+01  Top1 acc=95.9683% Top5 acc=99.9700%
+epoch340: InfoNCE Loss=3.412353e+01  Top1 acc=95.9033% Top5 acc=99.9767%
+epoch350: InfoNCE Loss=3.411478e+01  Top1 acc=95.8833% Top5 acc=99.9850%
+epoch360: InfoNCE Loss=3.405993e+01  Top1 acc=96.0550% Top5 acc=99.9700%
+epoch370: InfoNCE Loss=3.452979e+01  Top1 acc=95.7533% Top5 acc=99.9783%
+epoch380: InfoNCE Loss=3.440165e+01  Top1 acc=95.7250% Top5 acc=99.9783%
+epoch390: InfoNCE Loss=3.404430e+01  Top1 acc=95.8133% Top5 acc=99.9700%
+epoch400: InfoNCE Loss=3.407898e+01  Top1 acc=95.7750% Top5 acc=99.9717%
+epoch410: InfoNCE Loss=3.426864e+01  Top1 acc=95.9900% Top5 acc=99.9717%
+epoch420: InfoNCE Loss=3.378460e+01  Top1 acc=95.8017% Top5 acc=99.9633%
+epoch430: InfoNCE Loss=3.400578e+01  Top1 acc=95.9317% Top5 acc=99.9733%
+epoch440: InfoNCE Loss=3.366243e+01  Top1 acc=95.9083% Top5 acc=99.9683%
+epoch450: InfoNCE Loss=3.415526e+01  Top1 acc=95.8633% Top5 acc=99.9700%
+epoch460: InfoNCE Loss=3.399506e+01  Top1 acc=95.9750% Top5 acc=99.9767%
+epoch470: InfoNCE Loss=3.415867e+01  Top1 acc=95.8950% Top5 acc=99.9717%
+epoch480: InfoNCE Loss=3.368746e+01  Top1 acc=95.9767% Top5 acc=99.9783%
+epoch490: InfoNCE Loss=3.479182e+01  Top1 acc=95.9367% Top5 acc=99.9700%

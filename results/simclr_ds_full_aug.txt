@@ -1,0 +1,109 @@
+from torchvision import datasets, transforms
+import torch
+from utilities import Sobel
+from SimCLR_model import SimCLR_DownStream
+device = ("cuda:0" if torch.cuda.is_available else "cpu")
+
+train_dataset = datasets.MNIST(root="./dataset", train=True, transform=transforms.ToTensor(), download=True)
+Ntr = 60000
+torch.manual_seed(0)
+chosen_tr = torch.randperm(train_dataset.data.size(dim=0))[:Ntr]
+
+train_dataset.data = train_dataset.data[chosen_tr,:,:] # [Ntr, 28, 28] float32  /255
+train_dataset.targets = train_dataset.targets[chosen_tr]
+train_dataset.targets.requires_grad = False
+trainloader = torch.utils.data.DataLoader(train_dataset,batch_size=256, shuffle=True)
+
+simclr = SimCLR_DownStream(out_feas=10, device=device)
+simclr.load_state_dict(torch.load("./models/simclr_unsup_tau0.1_Adam_lr0.0003_decay0.0002_Ntr6000_eph180.pth",map_location=device),strict=False)
+simclr.fit(trainloader,max_epoch=1000,lr=1e-3)
+
+
+
+class SimCLR_DownStream(nn.Module):
+    def __init__(self, out_feas=128, gray=True, device="cuda:0"):
+        super(self.__class__, self).__init__()
+
+        # self.backbone = SimCLR().backbone.to(device)
+        self.backbone = models.resnet50(pretrained=False).to(device)
+        mlp_in_feas = self.backbone.fc.in_features
+        if gray: self.backbone.conv1 = torch.nn.Conv2d(1,64,kernel_size=7,stride=2, padding=3, bias=False).to(device)
+        for param in self.backbone.parameters():
+            param.requires_grad = False # 冻结网络f, 训练过程中不更新f的参数
+
+        # self.mlp = nn.Sequential(
+        #     nn.Linear(in_features=mlp_in_feas, out_features=mlp_in_feas, bias=True),
+        #     nn.ReLU(),
+        #     nn.Linear(in_features=mlp_in_feas, out_features=out_feas, bias=True),
+        #     ).to(device)
+        self.backbone.fc = nn.Linear(in_features=mlp_in_feas, out_features=out_feas, bias=True).to(device)
+        self.loss_fn = nn.CrossEntropyLoss().to(device)
+
+    def forward(self, X): # X:[B,1,28,28](MNIST)
+        z = self.backbone(X) # h:[B,512]
+        # z = self.mlp(h) # z:[B,out_feas];
+        return z
+
+    def fit(self, trainloader, lr=1e-3, weight_decay=2e-4, max_epoch=500, device="cuda:0"):
+        print("...Training...\nlr={:.4f}  wei_decay={:.4f}  epoches={:d}  bs={:d}"\
+              .format(lr,weight_decay,max_epoch,trainloader.batch_size))
+
+        optimizer = torch.optim.Adam(self.backbone.fc.parameters(), lr=lr,weight_decay=weight_decay) # 
+        for epoch in range(1,max_epoch+1):
+            self.train()
+            Tr_loss = 0
+            for X,labels in trainloader:
+                X, labels = X.to(device), labels.to(device)
+                z = self.forward(X) # [bs,cls]
+                loss = self.loss_fn(z, labels) # cross entropy
+                Tr_loss += loss.item()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            if epoch%10==0:
+                torch.save(self.state_dict(), "./models/down_stream/"+str(optimizer.__class__)[-6:-2]\
+                           +"_lr"+str(lr)+"_decay"+str(weight_decay)+"_eph"+str(epoch)+".pth")
+                self.eval()
+                with torch.no_grad():
+                    total_correct_1, total_correct_5, total_num = 0.0, 0.0, 0
+                    for data, labels in trainloader:
+                        data, labels = data.to(device), labels.to(device)
+                        total_num += data.size(dim=0)
+
+                        pred_cls = self.forward(data)
+                        _, pred_cls = torch.topk(pred_cls, k=5, dim=-1, largest=True)
+                        top1_acc = torch.sum(( pred_cls[:,0] == labels ).float()).item() # item():tensor->float
+                        top5_acc = torch.sum(( pred_cls[:,0:5] == labels.unsqueeze(-1).repeat(1,5) ).any(dim=-1)).item()
+                        total_correct_1 += top1_acc
+                        total_correct_5 += top5_acc
+                    print("epoch{:3d}: InfoNCE Loss={:e} ".format(epoch, Tr_loss),
+                          "Top1 acc={:.4f}%".format(total_correct_1/total_num*100),
+                          "Top5 acc={:.4f}%".format(total_correct_5/total_num*100))
+
+
+
+
+
+...Training...
+lr=0.0010  wei_decay=0.0002  epoches=1000  bs=256
+epoch 10: InfoNCE Loss=5.385711e+01  Top1 acc=92.8617% Top5 acc=99.8833%
+epoch 20: InfoNCE Loss=4.570792e+01  Top1 acc=94.4183% Top5 acc=99.9217%
+epoch 30: InfoNCE Loss=4.203534e+01  Top1 acc=94.8767% Top5 acc=99.9550%
+epoch 40: InfoNCE Loss=3.876437e+01  Top1 acc=95.1383% Top5 acc=99.9583%
+epoch 50: InfoNCE Loss=3.738080e+01  Top1 acc=95.3017% Top5 acc=99.9733%
+epoch 60: InfoNCE Loss=3.613519e+01  Top1 acc=95.4533% Top5 acc=99.9667%
+epoch 70: InfoNCE Loss=3.492410e+01  Top1 acc=95.6583% Top5 acc=99.9617%
+epoch 80: InfoNCE Loss=3.410289e+01  Top1 acc=96.0367% Top5 acc=99.9767%
+epoch 90: InfoNCE Loss=3.427103e+01  Top1 acc=95.7033% Top5 acc=99.9750%
+epoch100: InfoNCE Loss=3.341378e+01  Top1 acc=95.3750% Top5 acc=99.9733%
+epoch110: InfoNCE Loss=3.283558e+01  Top1 acc=96.2433% Top5 acc=99.9767%
+epoch120: InfoNCE Loss=3.294797e+01  Top1 acc=96.0800% Top5 acc=99.9783%
+epoch130: InfoNCE Loss=3.215293e+01  Top1 acc=96.1267% Top5 acc=99.9833%
+epoch140: InfoNCE Loss=3.280625e+01  Top1 acc=95.8117% Top5 acc=99.9817%
+epoch150: InfoNCE Loss=3.206091e+01  Top1 acc=96.0167% Top5 acc=99.9800%
+epoch160: InfoNCE Loss=3.193850e+01  Top1 acc=96.0933% Top5 acc=99.9833%
+epoch170: InfoNCE Loss=3.182382e+01  Top1 acc=96.2567% Top5 acc=99.9850%
+epoch180: InfoNCE Loss=3.201159e+01  Top1 acc=96.3617% Top5 acc=99.9850%
+epoch190: InfoNCE Loss=3.206631e+01  Top1 acc=96.2850% Top5 acc=99.9850%
+epoch200: InfoNCE Loss=3.173464e+01  Top1 acc=96.4033% Top5 acc=99.9900%

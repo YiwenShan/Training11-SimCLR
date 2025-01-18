@@ -1,0 +1,211 @@
+from torchvision import datasets, transforms
+import torch
+from utilities import Sobel
+from SimCLR_model import SimCLR_DownStream
+device = ("cuda:0" if torch.cuda.is_available else "cpu")
+
+train_dataset = datasets.MNIST(root="./dataset", train=True, transform=transforms.ToTensor(), download=True)
+Ntr = 60000
+torch.manual_seed(0)
+chosen_tr = torch.randperm(train_dataset.data.size(dim=0))[:Ntr]
+
+train_dataset.data = train_dataset.data[chosen_tr,:,:] # [Ntr, 28, 28] float32  /255
+train_dataset.targets = train_dataset.targets[chosen_tr]
+train_dataset.targets.requires_grad = False
+trainloader = torch.utils.data.DataLoader(train_dataset,batch_size=256, shuffle=True)
+
+simclr = SimCLR_DownStream(out_feas=10, device=device)
+simclr.load_state_dict(torch.load("./models/simclr_unsup_tau0.1_Adam_lr0.0003_decay0.0002_Ntr6000_eph180.pth",map_location=device),strict=False)
+simclr.fit(trainloader,max_epoch=1000,lr=1e-3)
+
+
+class SimCLR(nn.Module):
+    def __init__(self, out_feas=128, tau=0.1, gray=False, device="cuda:0"):
+        super(self.__class__, self).__init__()
+
+        # ResNet18  最后一层是.fc: Linear(512,1000, bias=True)
+        # self.backbone = ResNet_bkbone(block=BasicBlock, layers=[2,2,2,2],grayscale=True).to(device)
+        self.backbone = models.resnet50(pretrained=False).to(device)
+        if gray: self.backbone.conv1 = torch.nn.Conv2d(1,64,kernel_size=7,stride=2, padding=3, bias=False).to(device)
+
+        # 替换resnet18最后的全连接层
+        mlp_in_feas = self.backbone.fc.in_features # resnet18的bkbong输出  resnet50是2048
+        self.backbone.fc = nn.Sequential(nn.Linear(mlp_in_feas, mlp_in_feas,bias=False),
+                                        nn.ReLU(),
+                                        nn.Linear(mlp_in_feas, out_feas)).to(device)
+
+        self.loss_fn = nn.CrossEntropyLoss().to(device)
+        self.views = 2
+        self.tau = tau
+
+    def forward(self, X): # X:[B,1,28,28](MNIST)
+        z = self.backbone(X) # h:[B,512]
+        # z = self.mlp(h) # z:[B,out_feas]
+        return z
+
+    def infoNCE(self, features): # features:[2bs,d]
+        device = features.device
+        bs = features.size(dim=0)//2
+
+        labels = torch.cat([torch.arange(bs) for i in range(self.views)], dim=0) # [2bs]
+        labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float() # [2*bs,2*bs]
+        labels = labels.to(device)
+
+        features = torch.nn.functional.normalize(features, dim=1) # 归一化后, torch.sum(features*features, dim=1) = 全1
+        sim = torch.matmul(features, features.T) # [2*bs,2*bs] [i,j]: (xi.T * xj)/(||xi||2 * ||xj||2)
+
+        mask = torch.eye(labels.shape[0], dtype=torch.bool).to(device) # [2bs,2bs] bool单位阵
+        labels = labels[~mask].view(labels.shape[0], -1) # [2bs, 2bs-1] 等价于: labels挖去对角线元素, 右上角矩阵向左移1格
+        sim = sim[~mask].view(sim.shape[0], -1) # [2bs, 2bs-1]
+
+        # select and combine multiple positives
+        positives = sim[labels.bool()].view(labels.shape[0], -1) # [2bs,1]
+        negatives = sim[~labels.bool()].view(sim.shape[0], -1) # [2bs,2bs-2]
+        logits = torch.cat([positives, negatives], dim=1) # [2bs,2bs-1] 把simi_mat中labels==True的位置(共2bs个)移到第一列
+        logits = logits / self.tau
+
+        targets = torch.zeros(logits.shape[0], dtype=torch.long).to(device) # [2bs]
+        return logits, targets # labels全0
+
+    def fit(self, trainloader, lr=1e-3, momentum=0.9, weight_decay=2e-4, max_epoch=500,start_epoch=0, device="cuda:0"):
+        print("...Training...")
+        print("lr={:e}  mom={:.2f}  wei_decay={:e}  epoches={:d}  bs={:d}"\
+              .format(lr,momentum,weight_decay,max_epoch,trainloader.batch_size))
+        # optimizer = LARS(self.parameters(), lr,momentum,weight_decay,eta,max_epoch)
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr,weight_decay=weight_decay) # ,momentum=momentum
+        for epoch in range(1+start_epoch,max_epoch+1):
+            self.train()
+            Tr_loss = 0
+            for X,_ in trainloader:
+                X = torch.cat(X, dim=0).to(device) # list:[[bs,C,H,W],[bs,C,H,W]] -> Tensor:[2bs,C,H,W]
+            # for (imgL,imgR,labels) in trainloader:
+            #     X = torch.cat((imgL, imgR), dim=0).to(device)
+                z = self.forward(X) # [2bs,d]
+                logits,targets = self.infoNCE(z) #logits:[2bs,2bs-1]  targets:[2bs]
+                loss = self.loss_fn(logits, targets)
+                Tr_loss += loss.item()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            print("epoch {:3d}  InfoNCE Loss={:e}".format(epoch, Tr_loss))
+
+            if (epoch) % 10==0:
+                torch.save(self.state_dict(), "./models/simclr_unsup_tau"+str(self.tau)+"_"+str(optimizer.__class__)[-6:-2]+"_lr"+str(lr)\
+                        +"_decay"+str(weight_decay)+"_Ntr"+str(trainloader.dataset.data.size(0))+"_eph"+str(epoch)+".pth")
+        torch.save(self.state_dict(), "./models/simclr_unsup_tau"+str(self.tau)+"_"+str(optimizer.__class__)[-6:-2]+"_lr"+str(lr)\
+                +"_decay"+str(weight_decay)+"_Ntr"+str(trainloader.dataset.data.size(0))+"_eph"+str(epoch)+".pth")
+
+
+
+epoch  89  InfoNCE Loss=9.198248e-01
+epoch  90  InfoNCE Loss=9.146708e-01
+epoch  91  InfoNCE Loss=9.060154e-01
+epoch  92  InfoNCE Loss=9.002123e-01
+epoch  93  InfoNCE Loss=8.981371e-01
+epoch  94  InfoNCE Loss=8.919241e-01
+epoch  95  InfoNCE Loss=8.869440e-01
+epoch  96  InfoNCE Loss=8.823974e-01
+epoch  97  InfoNCE Loss=8.815603e-01
+epoch  98  InfoNCE Loss=8.756923e-01
+epoch  99  InfoNCE Loss=8.734250e-01
+epoch 100  InfoNCE Loss=8.625243e-01
+epoch 101  InfoNCE Loss=8.606196e-01
+epoch 102  InfoNCE Loss=8.665381e-01
+epoch 103  InfoNCE Loss=8.583782e-01
+epoch 104  InfoNCE Loss=8.566851e-01
+epoch 105  InfoNCE Loss=8.499685e-01
+epoch 106  InfoNCE Loss=8.547387e-01
+epoch 107  InfoNCE Loss=8.982964e-01
+epoch 108  InfoNCE Loss=8.807527e-01
+epoch 109  InfoNCE Loss=9.017994e-01
+epoch 110  InfoNCE Loss=8.806082e-01
+epoch 111  InfoNCE Loss=8.717248e-01
+epoch 112  InfoNCE Loss=8.721517e-01
+epoch 113  InfoNCE Loss=8.838191e-01
+epoch 114  InfoNCE Loss=8.706265e-01
+epoch 115  InfoNCE Loss=8.757225e-01
+epoch 116  InfoNCE Loss=8.587258e-01
+epoch 117  InfoNCE Loss=8.482750e-01
+epoch 118  InfoNCE Loss=8.376224e-01
+epoch 119  InfoNCE Loss=8.329898e-01
+epoch 120  InfoNCE Loss=8.616287e-01
+epoch 121  InfoNCE Loss=8.475291e-01
+epoch 122  InfoNCE Loss=8.281487e-01
+epoch 123  InfoNCE Loss=8.306667e-01
+epoch 124  InfoNCE Loss=8.174724e-01
+epoch 125  InfoNCE Loss=8.627181e-01
+epoch 126  InfoNCE Loss=8.278853e-01
+epoch 127  InfoNCE Loss=8.129587e-01
+epoch 128  InfoNCE Loss=8.050145e-01
+epoch 129  InfoNCE Loss=8.005816e-01
+epoch 130  InfoNCE Loss=7.985789e-01
+epoch 131  InfoNCE Loss=7.941085e-01
+epoch 132  InfoNCE Loss=7.884754e-01
+epoch 133  InfoNCE Loss=7.855638e-01
+epoch 134  InfoNCE Loss=7.852202e-01
+epoch 135  InfoNCE Loss=7.823097e-01
+epoch 136  InfoNCE Loss=7.804646e-01
+epoch 137  InfoNCE Loss=7.799768e-01
+epoch 138  InfoNCE Loss=7.776683e-01
+epoch 139  InfoNCE Loss=7.799091e-01
+epoch 140  InfoNCE Loss=7.703892e-01
+epoch 141  InfoNCE Loss=7.717327e-01
+epoch 142  InfoNCE Loss=7.729078e-01
+epoch 143  InfoNCE Loss=7.745950e-01
+epoch 144  InfoNCE Loss=7.768466e-01
+epoch 145  InfoNCE Loss=7.692430e-01
+epoch 146  InfoNCE Loss=7.687168e-01
+epoch 147  InfoNCE Loss=7.691117e-01
+epoch 148  InfoNCE Loss=7.698623e-01
+epoch 149  InfoNCE Loss=8.105556e-01
+epoch 150  InfoNCE Loss=1.226482e+00
+epoch 151  InfoNCE Loss=4.361266e+00
+epoch 152  InfoNCE Loss=1.109829e+01
+epoch 153  InfoNCE Loss=1.169656e+01
+epoch 154  InfoNCE Loss=8.544503e+00
+epoch 155  InfoNCE Loss=5.899104e+00
+epoch 156  InfoNCE Loss=4.327489e+00
+epoch 157  InfoNCE Loss=3.435810e+00
+epoch 158  InfoNCE Loss=2.680609e+00
+epoch 159  InfoNCE Loss=2.199735e+00
+epoch 160  InfoNCE Loss=1.812344e+00
+epoch 161  InfoNCE Loss=1.674897e+00
+epoch 162  InfoNCE Loss=1.486795e+00
+epoch 163  InfoNCE Loss=1.388390e+00
+epoch 164  InfoNCE Loss=1.305275e+00
+epoch 165  InfoNCE Loss=1.236607e+00
+epoch 166  InfoNCE Loss=1.191049e+00
+epoch 167  InfoNCE Loss=1.147562e+00
+epoch 168  InfoNCE Loss=1.121426e+00
+epoch 169  InfoNCE Loss=1.084780e+00
+epoch 170  InfoNCE Loss=1.055463e+00
+epoch 171  InfoNCE Loss=1.062902e+00
+epoch 172  InfoNCE Loss=1.050582e+00
+epoch 173  InfoNCE Loss=1.024921e+00
+epoch 174  InfoNCE Loss=9.959550e-01
+epoch 175  InfoNCE Loss=9.677132e-01
+epoch 176  InfoNCE Loss=9.555799e-01
+epoch 177  InfoNCE Loss=9.415820e-01
+epoch 178  InfoNCE Loss=9.269583e-01
+epoch 179  InfoNCE Loss=9.201394e-01
+epoch 180  InfoNCE Loss=9.071931e-01
+epoch 181  InfoNCE Loss=9.006771e-01
+epoch 182  InfoNCE Loss=8.889673e-01
+epoch 183  InfoNCE Loss=8.820626e-01
+epoch 184  InfoNCE Loss=8.710378e-01
+epoch 185  InfoNCE Loss=8.663262e-01
+epoch 186  InfoNCE Loss=8.591512e-01
+epoch 187  InfoNCE Loss=8.506358e-01
+epoch 188  InfoNCE Loss=8.474858e-01
+epoch 189  InfoNCE Loss=8.419085e-01
+epoch 190  InfoNCE Loss=8.390824e-01
+epoch 191  InfoNCE Loss=8.314187e-01
+epoch 192  InfoNCE Loss=8.273870e-01
+epoch 193  InfoNCE Loss=8.173182e-01
+epoch 194  InfoNCE Loss=8.165816e-01
+epoch 195  InfoNCE Loss=8.126637e-01
+epoch 196  InfoNCE Loss=8.070340e-01
+epoch 197  InfoNCE Loss=8.031187e-01
+epoch 198  InfoNCE Loss=7.969909e-01
+epoch 199  InfoNCE Loss=7.946713e-01
+epoch 200  InfoNCE Loss=7.895955e-01
